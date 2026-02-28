@@ -3,7 +3,7 @@
 Generador de Facturas de Evaluación (Rúbricas Automatizadas)
 =============================================================================
 
-Desarrollado por: Daniel Alemán RUiz
+Desarrollado por: Daniel Alemán Ruiz
 Institución: Instituto Tecnológico de Costa Rica (TEC)
 Uso: Exclusivo para fines académicos y asistencia docente.
 
@@ -20,6 +20,7 @@ import pandas as pd
 import os
 import openpyxl
 from copy import copy
+import re
 
 # Configuración de la página
 st.set_page_config(page_title="Generador de Facturas", page_icon="📝", layout="centered")
@@ -40,6 +41,12 @@ def copiar_formato(celda_origen, celda_destino):
         celda_destino.fill = copy(celda_origen.fill)
         celda_destino.number_format = copy(celda_origen.number_format)
         celda_destino.alignment = copy(celda_origen.alignment)
+
+def limpiar_nombre_archivo(nombre):
+    # Elimina los caracteres que Windows odia 
+    # y cambia espacios por guiones bajos
+    nombre_limpio = re.sub(r'[<>:"/\\|?*]', '', nombre)
+    return nombre_limpio.strip().replace(" ", "_")
 
 st.subheader("1. Selección de Curso")
 df_cursos = cargar_cursos("cursos.csv")
@@ -119,22 +126,54 @@ if not df_cursos.empty:
                     st.subheader("3. Configuración de la Tarea")
                     
                     nombre_tarea = st.text_input("Nombre de la tarea:", "Tarea 1")
-                    num_partes = st.number_input("Cantidad de partes:", min_value=1, max_value=20, value=1)
+                    
+                    # NUEVO: Etiqueta personalizada
+                    etiqueta_parte = st.text_input("¿Cómo llamar a las divisiones? (Ej: Parte, Ejercicio, Reto):", "Parte")
+                    
+                    # --- Lógica de autocompletado de pesos ---
+                    if "prev_num_partes" not in st.session_state:
+                        st.session_state.prev_num_partes = 1
+
+                    num_partes = st.number_input(f"Cantidad de {etiqueta_parte.lower()}s:", min_value=1, max_value=20, value=1, key="num_partes_input")
+
+                    # Si el usuario cambia el número de partes, se reparte el 100% equitativamente
+                    if num_partes != st.session_state.prev_num_partes:
+                        peso_eq = 100.0 / num_partes
+                        for i in range(num_partes):
+                            st.session_state[f"peso_{i}"] = peso_eq
+                        st.session_state.prev_num_partes = num_partes
+                    # ------------------------------------------------------------------
                     
                     pesos = []
-                    if num_partes == 1:
-                        peso = st.number_input("Porcentaje de relevancia Parte 1 (%):", min_value=1, max_value=100, value=100)
-                        pesos.append(peso)
-                    else:
-                        st.write("Porcentajes de relevancia por parte:")
-                        cols = st.columns(num_partes)
-                        for i in range(num_partes):
-                            with cols[i]:
-                                peso = st.number_input(f"P {i+1} (%)", min_value=0, max_value=100, value=100//num_partes, key=f"peso_{i}")
-                                pesos.append(peso)
+                    nombres_especificos = []
                     
-                    if sum(pesos) != 100:
-                        st.warning(f"⚠️ La suma total de los porcentajes es {sum(pesos)}%. Lo ideal es que sea 100%.")
+                    st.write(f"### Configuración de {etiqueta_parte}s")
+                    
+                    with st.expander(f"Ver detalles de cada {etiqueta_parte.lower()}", expanded=True):
+                        if num_partes == 1:
+                            if "peso_0" not in st.session_state:
+                                st.session_state["peso_0"] = 100.0
+                            peso = st.number_input("Peso (%)", min_value=0.0, max_value=100.0, step=0.5, key="peso_0")
+                            nombre_esp = st.text_input(f"Nombre del {etiqueta_parte} 1:", placeholder="Ej: Algoritmos de búsqueda")
+                            pesos.append(peso)
+                            nombres_especificos.append(nombre_esp)
+                        else:
+                            for i in range(num_partes):
+                                st.markdown(f"**{etiqueta_parte} {i+1}**")
+                                if f"peso_{i}" not in st.session_state:
+                                    st.session_state[f"peso_{i}"] = 100.0 / num_partes
+                                
+                                peso = st.number_input("Peso (%)", min_value=0.0, max_value=100.0, step=0.5, key=f"peso_{i}")
+                                nombre_esp = st.text_input("Nombre", key=f"nom_{i}", placeholder=f"Opcional para {etiqueta_parte.lower()} {i+1}")
+                                
+                                pesos.append(peso)
+                                nombres_especificos.append(nombre_esp)
+                                
+                                if i < num_partes - 1:
+                                    st.divider()
+                    
+                    if abs(sum(pesos) - 100.0) > 0.1:
+                        st.warning(f"⚠️ La suma total de los porcentajes es {sum(pesos):.1f}%. Lo ideal es que sea 100%.")
 
                     carpeta_salida = st.text_input("Carpeta para guardar los archivos:", "Resultados_Facturas")
 
@@ -170,16 +209,34 @@ if not df_cursos.empty:
                                     alineacion_neta = copy(ws['D11'].alignment)
                                     
                                     if num_partes > 1:
-                                        try:
-                                            ws.unmerge_cells('D11:H11')
-                                        except Exception:
-                                            pass
-                                            
+                                        # Descombinar celdas originales antes de insertar
+                                        for row_idx in [10, 11, 12]:
+                                            try:
+                                                ws.unmerge_cells(f'D{row_idx}:H{row_idx}')
+                                            except Exception:
+                                                pass
+                                                
                                         ws.insert_rows(10, amount=num_partes - 1)
+                                        
+                                        # Limpiador de celdas fantasma (Destruye uniones accidentales como E13:H13)
+                                        fusiones_a_borrar = []
+                                        for merge in list(ws.merged_cells.ranges):
+                                            if 9 <= merge.min_row <= 9 + num_partes:
+                                                fusiones_a_borrar.append(str(merge))
+                                        
+                                        for fusion in fusiones_a_borrar:
+                                            try:
+                                                ws.unmerge_cells(fusion)
+                                            except Exception:
+                                                pass
                                     
                                     for i in range(num_partes):
                                         fila_actual = 9 + i
-                                        ws[f'A{fila_actual}'] = f"Parte {i+1}"
+                                        texto_celda = f"{etiqueta_parte} {i+1}"
+                                        if nombres_especificos[i].strip():
+                                            texto_celda += f": {nombres_especificos[i]}"
+                                            
+                                        ws[f'A{fila_actual}'] = texto_celda
                                         ws[f'B{fila_actual}'] = pesos[i]
                                         
                                         ws[f'J{fila_actual}'] = f"=(C{fila_actual}*$C$8+D{fila_actual}*$D$8+E{fila_actual}*$E$8+F{fila_actual}*$F$8+G{fila_actual}*$G$8+H{fila_actual}*$H$8)*B{fila_actual}/100"
@@ -208,7 +265,7 @@ if not df_cursos.empty:
                                     ws[f'J{fila_nota_final}'] = f"=J{fila_nota_neta}-J{fila_nota_neta}*F{fila_suma_tardia}"
 
                                     # 4. Guardar archivo
-                                    nombre_tarea_limpio = nombre_tarea.replace(" ", "_")
+                                    nombre_tarea_limpio = limpiar_nombre_archivo(nombre_tarea)
                                     nombre_archivo = f"Factura_{nombre_tarea_limpio}_{siglas_curso}_{nombre_estudiantes_archivo}.xlsx"
                                     ruta_guardado = os.path.join(carpeta_salida, nombre_archivo)
                                     
